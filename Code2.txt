@@ -1,0 +1,108 @@
+"""
+map_to_class.py
+Map toy fragmentation output (k_centers.npy, P_k_bin.npy) -> physical k [Mpc^-1] and normalized P_R(k)
+Writes `primordial_power.dat` (k [Mpc^-1], P_R(k)) ready for CLASS/CAMB.
+
+Usage:
+  Place k_centers.npy and P_k_bin.npy in the same folder and run:
+    python map_to_class.py
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.interpolate import interp1d
+import os
+
+# -------------- USER PARAMETERS (edit) --------------
+# Physical choices:
+L_phys_Gpc = 14.0      # physical box size in Gpc to map toy box to observable universe; change if desired
+L_phys_Mpc = L_phys_Gpc * 1000.0  # convert Gpc -> Mpc
+
+# Planck normalization:
+A_s_target = 2.10e-9   # pivot amplitude (Planck 2018-ish)
+k_pivot = 0.05         # Mpc^-1 (pivot)
+# Input filenames (from your toy run)
+k_file = 'k_centers.npy'    # array of toy k centers (same units as toy script)
+P_file = 'P_k_bin.npy'      # array of toy P(k) from toy script (same ordering)
+
+# Output:
+out_fname = 'primordial_power.dat'
+plot_fname = 'mapped_Pk.png'
+
+# -------------- Load toy data --------------
+if not (os.path.exists(k_file) and os.path.exists(P_file)):
+    raise FileNotFoundError("Make sure k_centers.npy and P_k_bin.npy are in the working directory.")
+
+k_toy = np.load(k_file)         # shape (n_bins,)
+P_toy = np.load(P_file)         # shape (n_bins,)
+# Some toy runs may contain zeros for empty bins; remove or mask
+mask = (P_toy > 0) & np.isfinite(P_toy)
+k_toy = k_toy[mask]
+P_toy = P_toy[mask]
+
+# -------------- Convert toy k -> physical k (Mpc^-1) --------------
+# If toy L_toy = 1.0 in earlier script:
+L_toy = 1.0
+k_phys = k_toy / L_phys_Mpc    # because k_toy units were 1/L_toy, so scale by 1/L_phys
+# Note: if your toy script included 2*pi conventions, keep consistent by ensuring k_toy matched that usage.
+
+# -------------- Interpolate toy P(k) in log-log space --------------
+# We'll build an interpolation function P_toy(k_phys) on log-log to avoid negative values issues.
+logk = np.log(k_phys)
+logP = np.log(P_toy)
+
+# create interpolator
+interp = interp1d(logk, logP, kind='linear', fill_value='extrapolate', assume_sorted=True)
+
+def P_toy_phys(k):
+    # k: array of physical k in Mpc^-1
+    lk = np.log(k)
+    return np.exp(interp(lk))
+
+# -------------- Choose k grid to output --------------
+# CLASS likes k spanning ~1e-6 -> 1e1 Mpc^-1 (we'll produce 200 points log-spaced across a reasonable range)
+kmin_out = 1e-5
+kmax_out = 10.0
+n_out = 300
+k_out = np.logspace(np.log10(kmin_out), np.log10(kmax_out), n_out)
+
+# -------------- Compute toy P(k) on output grid and normalize to pivot A_s --------------
+P_out_toy = P_toy_phys(k_out)
+
+# Find toy value near pivot by interpolation
+P_pivot_toy = P_toy_phys(np.array([k_pivot]))[0]
+if P_pivot_toy <= 0 or not np.isfinite(P_pivot_toy):
+    raise ValueError("Toy P(k) at pivot is non-positive or non-finite. Check toy output and L_phys mapping.")
+
+# Normalization factor
+scale_factor = A_s_target / P_pivot_toy
+P_out_norm = P_out_toy * scale_factor
+
+# -------------- Diagnostics printout --------------
+print("Mapping diagnostic:")
+print(f"Physical box size used (Mpc): {L_phys_Mpc:.3e}")
+print(f"Toy pivot P(k_pivot={k_pivot}): {P_pivot_toy:.3e}")
+print(f"Scale factor to match A_s={A_s_target:.3e}: {scale_factor:.3e}")
+
+# -------------- Save ASCII file (CLASS/CAMB format: k  P_R(k) ) --------------
+with open(out_fname, 'w') as f:
+    for k_val, P_val in zip(k_out, P_out_norm):
+        f.write(f"{k_val:.12e} {P_val:.12e}\n")
+print("Wrote primordial power file:", out_fname)
+
+# -------------- Quick plot --------------
+plt.figure(figsize=(6,4))
+plt.loglog(k_out, P_out_norm, label='Normalized P_R(k)')
+plt.axvline(k_pivot, color='gray', linestyle='--', label=f'pivot {k_pivot} Mpc^-1')
+plt.xlabel('k [Mpc^-1]')
+plt.ylabel('P_R(k)')
+plt.title('Mapped & Normalized Primordial Power Spectrum')
+plt.legend()
+plt.grid(True, which='both', ls=':')
+plt.savefig(plot_fname, dpi=200)
+plt.close()
+print("Plot saved:", plot_fname)
+
+# -------------- Final note --------------
+print("File ready for CLASS/ CAMB ingestion. Use your usual settings to read external primordial spectrum.")
+print("If your CAMB/CLASS expects delta ln k sampling or different header, adapt as needed (both accept 2-column files).")

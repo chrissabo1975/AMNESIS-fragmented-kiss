@@ -1,0 +1,168 @@
+"""
+vectorized_fragmentation.py
+Fast toy fragmentation generator using FFT convolution.
+
+Dependencies:
+  - numpy
+  - scipy (for gaussian window in k-space if desired)
+  - h5py (optional; for saving large arrays)
+  - matplotlib (optional; for quick plots)
+
+Run:
+  python vectorized_fragmentation.py
+"""
+
+import numpy as np
+import os
+import time
+from numpy.fft import fftn, ifftn, fftfreq, fftshift
+import matplotlib.pyplot as plt
+
+# -------------------------
+# USER PARAMETERS (edit)
+# -------------------------
+L = 1.0                   # box side length (arbitrary units)
+Ngrid = 256               # grid resolution (use 128/256/512 depending on RAM & CPU)
+seed_density = 2e6        # total seeds per box (controls N_frag; choose large for smoothness)
+sigma = 0.005 * L         # Gaussian kernel width (smoothing length)
+A_mean = 1.0              # mean amplitude of seeds
+A_std = 0.2               # amplitude scatter
+mu_h = 0.0                # average handedness (-1..+1); 0 = symmetric
+rng_seed = 123456
+out_prefix = "frag_run"
+
+# -------------------------
+# Derived parameters
+# -------------------------
+dx = L / Ngrid
+Vbox = L**3
+rng = np.random.default_rng(rng_seed)
+
+# -------------------------
+# Step A: sample coarse seed map (grid of seed counts / amplitudes)
+# We will place seeds by sampling a continuous Poisson field approximated on the grid.
+# Each grid cell represents a micro-region; the number of seeds per cell ~ Poisson(lambda)
+# where lambda = seed_density / Ngrid**3 * (cell_volume / unit).
+# -------------------------
+cell_volume = dx**3
+total_seeds = int(seed_density)
+print(f"Box L={L}, Ngrid={Ngrid}, dx={dx:.5e}, total_seeds={total_seeds}")
+
+# We'll build a sparse seeds map by randomly assigning seed positions into grid cells:
+#  - Equivalent to sampling N_seeds uniform positions and accumulating counts per cell.
+# This is efficient vectorized approach that avoids per-seed loops.
+
+# sample uniform positions
+t0 = time.time()
+pos = rng.random((total_seeds, 3)) * L  # shape (N,3)
+
+# compute cell indices
+indices = np.floor(pos / dx).astype(int) % Ngrid  # wrap safety
+# flatten indices to 1D keys for bincount
+keys = indices[:,0] + Ngrid * (indices[:,1] + Ngrid * indices[:,2])
+count_per_cell = np.bincount(keys, minlength=Ngrid**3).astype(np.int32)
+count_map = count_per_cell.reshape((Ngrid, Ngrid, Ngrid))
+print(f"Seed distribution -> nonzero cells: {np.count_nonzero(count_map)}")
+t1 = time.time()
+print("Seeding time:", t1-t0, "s")
+
+# sample amplitude per seed then aggregate per cell
+# to avoid per-seed loop, sample amplitudes once and accumulate using same keys
+A_values = rng.normal(loc=A_mean, scale=A_std, size=total_seeds)
+h_values = rng.choice([-1.0, +1.0], size=total_seeds, p=[(1-mu_h)/2, (1+mu_h)/2])
+weighted = A_values * h_values
+# sum weighted into cells
+sum_per_cell = np.bincount(keys, weights=weighted, minlength=Ngrid**3)
+sum_map = sum_per_cell.reshape((Ngrid, Ngrid, Ngrid))
+
+# The "seed density field" S(x) we will convolve with the Gaussian kernel:
+S = sum_map  # shape (Ngrid,Ngrid,Ngrid)
+
+# Optional: normalize by local counts to examine mean amplitudes
+mean_amp_map = np.zeros_like(S)
+nonzero_mask = count_map > 0
+mean_amp_map[nonzero_mask] = sum_map[nonzero_mask] / count_map[nonzero_mask]
+
+# -------------------------
+# Step B: prepare Gaussian kernel in k-space
+# Convolution in real space <-> multiplication in k-space for speed.
+# Build grid of k vectors.
+# -------------------------
+kx = fftfreq(Ngrid, d=dx) * 2.0 * np.pi   # angular k
+ky = kx.copy()
+kz = kx.copy()
+KX, KY, KZ = np.meshgrid(kx, ky, kz, indexing='ij')
+K2 = KX**2 + KY**2 + KZ**2
+sigma_k = 1.0 / sigma  # approximate inverse scale
+
+# Fourier transform of Gaussian kernel: ~ exp(-k^2 sigma^2 / 2) times normalization
+# But for convolution via FFT we can multiply by window W_k = exp(-0.5 * k^2 * sigma^2)
+Wk = np.exp(-0.5 * K2 * (sigma**2))
+
+# -------------------------
+# Step C: FFT seed field, multiply by Wk, inverse FFT -> R(x)
+# -------------------------
+t2 = time.time()
+S_k = fftn(S)                      # FFT of seed amplitude map
+R_k = S_k * Wk                     # apply kernel in k-space
+R = np.real(ifftn(R_k))            # real-space curvature field
+t3 = time.time()
+print("FFT convolution time:", t3-t2, "s")
+
+# Normalize R: set mean zero
+R -= np.mean(R)
+
+# -------------------------
+# Step D: compute 3D power spectrum P(k)
+# -------------------------
+t4 = time.time()
+R_k_full = fftn(R)
+P3d = (np.abs(R_k_full)**2) / Vbox    # crude normalization
+# k magnitude array (flattened)
+Kmag = np.sqrt(K2).ravel()
+Pvals = P3d.ravel()
+
+# bin isotropically: choose log bins
+k_nonzero = Kmag[Kmag > 0]
+kmin = k_nonzero.min()
+kmax = k_nonzero.max()
+nbins = 80
+kbins = np.logspace(np.log10(kmin), np.log10(kmax), nbins)
+k_centers = np.sqrt(kbins[:-1] * kbins[1:])
+Pk_bin = np.zeros(nbins-1)
+
+# vectorized binning
+inds = np.digitize(Kmag, kbins) - 1
+for i in range(nbins-1):
+    mask = (inds == i)
+    if np.any(mask):
+        Pk_bin[i] = Pvals[mask].mean()
+t5 = time.time()
+print("Power spectrum binning time:", t5-t4, "s")
+
+# -------------------------
+# Step E: save outputs
+# -------------------------
+os.makedirs(out_prefix, exist_ok=True)
+np.save(os.path.join(out_prefix, 'R_field.npy'), R.astype(np.float32))
+np.save(os.path.join(out_prefix, 'k_centers.npy'), k_centers)
+np.save(os.path.join(out_prefix, 'P_k_bin.npy'), Pk_bin)
+np.save(os.path.join(out_prefix, 'S_map.npy'), S.astype(np.float32))
+
+print("Saved outputs to", out_prefix)
+print("peak P(k) (max):", np.nanmax(Pk_bin), "min:", np.nanmin(Pk_bin))
+
+# -------------------------
+# Quick plot (optional)
+# -------------------------
+plt.loglog(k_centers, Pk_bin + 1e-30, label='toy P(k)')
+plt.xlabel("k (arbitrary units)")
+plt.ylabel("P(k)")
+plt.title("Toy fragmentation P(k)")
+plt.legend()
+plt.grid(True)
+plt.savefig(os.path.join(out_prefix, 'Pk_plot.png'), dpi=200)
+plt.close()
+print("Plot saved:", os.path.join(out_prefix, 'Pk_plot.png'))
+
+# Done.
